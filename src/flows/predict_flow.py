@@ -1,0 +1,153 @@
+from pathlib import Path
+import json
+
+from prefect import flow, get_run_logger
+from core.config import REFERENCE_DATA_PATH
+from data.loading import save_csv, load_csv
+from drift.data_drift import compute_data_drift
+from monitoring.prometheus import record_prediction_metrics
+from models.predict import predict_with_champion
+from storage.artifacts import compact_artifact_map, mirror_file_to_object_store
+from storage.truth_batches import latest_truth_path
+from storage.paths import (
+    data_drift_html_key,
+    data_drift_html_path,
+    data_drift_json_key,
+    data_drift_json_path,
+    data_drift_summary_key,
+    data_drift_summary_path,
+    prediction_output_key,
+    prediction_output_path,
+)
+
+
+def _select_drift_reference(batch_id: str) -> tuple[str, str]:
+    truth_reference = latest_truth_path(exclude_batch_id=batch_id)
+    if truth_reference is not None:
+        return str(truth_reference), "latest_truth_batch"
+    return str(REFERENCE_DATA_PATH), "bootstrap_reference"
+
+@flow(name="predict-batch", log_prints=True)
+def predict_batch_flow(
+    input_path: str,
+    batch_id: str,
+    output_path: str | None = None,
+) -> dict:
+    logger = get_run_logger()
+
+    if output_path is None:
+        output_path = str(prediction_output_path(batch_id))
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Starting prediction for batch_id=%s from %s", batch_id, input_path)
+
+    predictions = predict_with_champion(
+        csv_path=input_path,
+        batch_id=batch_id,
+    )
+
+    save_csv(predictions, output_path)
+    prediction_object = mirror_file_to_object_store(
+        output_path,
+        prediction_output_key(batch_id),
+        content_type="text/csv",
+    )
+
+    reference_path, reference_source = _select_drift_reference(batch_id)
+    reference_df = load_csv(reference_path)
+    current_df = load_csv(input_path)
+
+    reference_predictions = predict_with_champion(
+        csv_path=reference_path,
+        batch_id=f"{batch_id}-reference",
+    )
+
+    drift_html_path = data_drift_html_path(batch_id)
+    drift_json_path = data_drift_json_path(batch_id)
+    drift_summary_path = data_drift_summary_path(batch_id)
+
+    drift_metrics = compute_data_drift(
+        reference_df=reference_df,
+        current_df=current_df,
+        current_predictions=predictions,
+        reference_predictions=reference_predictions,
+        html_path=str(drift_html_path),
+        json_path=str(drift_json_path),
+    )
+    drift_html_object = mirror_file_to_object_store(
+        drift_html_path,
+        data_drift_html_key(batch_id),
+        content_type="text/html",
+    )
+    drift_json_object = mirror_file_to_object_store(
+        drift_json_path,
+        data_drift_json_key(batch_id),
+        content_type="application/json",
+    )
+
+    drift_summary_path.parent.mkdir(parents=True, exist_ok=True)
+    drift_summary_path.write_text(
+        json.dumps(
+            {
+                "batch_id": batch_id,
+                "input_path": input_path,
+                "reference_path": reference_path,
+                "reference_source": reference_source,
+                "drift_html_path": str(drift_html_path),
+                "drift_json_path": str(drift_json_path),
+                "metrics": drift_metrics,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    drift_summary_object = mirror_file_to_object_store(
+        drift_summary_path,
+        data_drift_summary_key(batch_id),
+        content_type="application/json",
+    )
+
+    model_version = str(predictions["model_version"].iloc[0])
+
+    logger.info(
+        "Saved %s prediction rows to %s using model version %s",
+        len(predictions),
+        output_path,
+        model_version,
+    )
+
+    summary = {
+        "batch_id": batch_id,
+        "input_path": input_path,
+        "output_path": output_path,
+        "row_count": len(predictions),
+        "model_name": predictions["model_name"].iloc[0],
+        "model_version": model_version,
+        "drift_html_path": str(drift_html_path),
+        "drift_json_path": str(drift_json_path),
+        "drift_summary_path": str(drift_summary_path),
+        "reference_path": reference_path,
+        "reference_source": reference_source,
+        "drift_metrics": drift_metrics,
+        "object_store": compact_artifact_map(
+            {
+                "prediction_output": prediction_object,
+                "data_drift_html": drift_html_object,
+                "data_drift_json": drift_json_object,
+                "data_drift_summary": drift_summary_object,
+            }
+        ),
+    }
+
+    record_prediction_metrics(summary)
+    return summary
+
+
+if __name__ == "__main__":
+    print(
+        predict_batch_flow(
+            input_path=str(REFERENCE_DATA_PATH),
+            batch_id="demo-batch",
+        )
+    )
